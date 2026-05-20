@@ -1,1 +1,2 @@
 # TradeVault
+We built TradeVault as a controlled execution vault for automated trading. It holds funds, grants allowances only to approved routers, and lets whitelisted executors submit swap calldata through those routers while the owner retains configuration, pause, and withdrawal control. The key design reason is multi-executor operation: by allowing several executor EOAs, each with its own account nonce, we avoid nonce competition when submitting multiple bundles in the same block. This enables parallel MEV/trading attempts, and capital efficiency.
