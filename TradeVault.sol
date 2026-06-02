@@ -29,6 +29,7 @@ interface IPermit2 {
 ///         whitelisted router address. The router whitelist is the security
 ///         boundary: only pre-approved, audited contracts may receive calldata
 ///         and token approvals from the vault.
+/// @custom:security-contact security@denayer.io
 contract TradeVault is Ownable2Step, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -40,19 +41,23 @@ contract TradeVault is Ownable2Step, Pausable, ReentrancyGuard {
     address public immutable WETH;
 
     /// @notice Addresses authorised to call swap, transfer, wrap/unwrap functions.
-    mapping(address => bool) public executors;
+    mapping(address executor => bool active) public executors;
 
     /// @notice Router contracts executors may relay arbitrary swap calldata to.
-    mapping(address => bool) public whitelistedRouters;
+    mapping(address router => bool active) public whitelistedRouters;
 
     /// @notice Permit2 contracts the vault may interact with for two-step approvals.
-    mapping(address => bool) public whitelistedPermit2;
+    mapping(address permit2 => bool active) public whitelistedPermit2;
 
     /// @notice Addresses to which executors may push tokens or ETH via transferToken/transferNative.
-    mapping(address => bool) public whitelistedDepositAddresses;
+    mapping(address destination => bool active) public whitelistedDepositAddresses;
 
     /// @notice Addresses to which executors may send ETH tips (e.g. block.coinbase, relayers).
-    mapping(address => bool) public whitelistedTipRecipients;
+    mapping(address recipient => bool active) public whitelistedTipRecipients;
+
+    /// @notice Per-router whitelist of 4-byte function selectors executors may invoke via swapViaRouter.
+    /// @dev    Fail-closed: a whitelisted router with no whitelisted selector cannot be called at all.
+    mapping(address router => mapping(bytes4 selector => bool active)) public whitelistedSelectors;
 
     // ═══════════════════════════════════════════════════════════════════
     //  ERRORS
@@ -78,6 +83,10 @@ contract TradeVault is Ownable2Step, Pausable, ReentrancyGuard {
     error TipRecipientNotWhitelisted(address to);
     /// @dev A protected address (WETH or a whitelisted router) was submitted as a Permit2 contract.
     error InvalidPermit2(address permit2);
+    /// @dev The function selector in the swap calldata is not whitelisted for the target router.
+    error SelectorNotWhitelisted(address router, bytes4 selector);
+    /// @dev The swap calldata is shorter than the 4-byte function selector.
+    error CallDataTooShort();
 
     // ═══════════════════════════════════════════════════════════════════
     //  EVENTS
@@ -89,6 +98,8 @@ contract TradeVault is Ownable2Step, Pausable, ReentrancyGuard {
     event RouterSet(address indexed router, bool active);
     /// @notice Emitted when a Permit2 contract is whitelisted or de-whitelisted.
     event Permit2Set(address indexed permit2, bool active);
+    /// @notice Emitted when a function selector is whitelisted or de-whitelisted for a router.
+    event SelectorSet(address indexed router, bytes4 indexed selector, bool active);
     /// @notice Emitted when a deposit destination is whitelisted or de-whitelisted.
     event DepositAddressSet(address indexed account, bool active);
     /// @notice Emitted when a tip recipient is whitelisted or de-whitelisted.
@@ -172,13 +183,45 @@ contract TradeVault is Ownable2Step, Pausable, ReentrancyGuard {
         emit RouterSet(_addr, _active);
     }
 
+    /// @notice Whitelist or remove a function selector a router may be called with via swapViaRouter.
+    /// @dev    Defence-in-depth against the universal-calldata relay: only pre-approved operations
+    ///         (e.g. a router's swap selector) may be invoked, so executors cannot trigger
+    ///         unintended router functionality such as addLiquidity or multicall.
+    ///         Selectors are scoped per-router because the same selector can be a harmless swap on
+    ///         one router and a dangerous operation on another. When activating, the router must
+    ///         already be whitelisted; removal (_active == false) is always permitted so a selector
+    ///         can be revoked even after the router itself is de-listed. Selector entries persist
+    ///         across router de-listing/re-listing — re-whitelisting a router restores its selectors.
+    /// @param _router   Router the selector applies to.
+    /// @param _selector 4-byte function selector (e.g. bytes4(keccak256("exactInputSingle(...)"))).
+    /// @param _active   True to allow the selector, false to disallow it.
+    function setSelector(address _router, bytes4 _selector, bool _active) external onlyOwner {
+        if (_active && !whitelistedRouters[_router]) revert RouterNotWhitelisted(_router);
+        whitelistedSelectors[_router][_selector] = _active;
+        emit SelectorSet(_router, _selector, _active);
+    }
+
     /// @notice Add or remove a Permit2 contract from the whitelist.
     /// @dev    Prevents whitelisting WETH or an already-whitelisted router as Permit2,
     ///         which would let an executor relay calldata to Permit2 via swapViaRouter.
-    function setPermit2(address _addr, bool _active) external onlyOwner {
+    ///         When deactivating, the vault's outstanding ERC-20 allowances to this
+    ///         Permit2 (set to uint256.max by approvePermit2Router) are revoked for each
+    ///         token in _tokensToRevoke. Pass every token previously approved to _addr,
+    ///         otherwise a de-whitelisted Permit2 retains spending power over vault funds.
+    ///         The array is ignored when _active == true.
+    /// @param _addr           Permit2 contract address.
+    /// @param _active         True to whitelist, false to remove.
+    /// @param _tokensToRevoke Tokens whose ERC-20 allowance to _addr is zeroed on removal.
+    function setPermit2(address _addr, bool _active, address[] calldata _tokensToRevoke) external onlyOwner {
         if (_addr == address(0)) revert ZeroAddress();
         if (_active && (_addr == WETH || whitelistedRouters[_addr])) revert InvalidPermit2(_addr);
         whitelistedPermit2[_addr] = _active;
+        if (!_active) {
+            for (uint256 i; i < _tokensToRevoke.length; ++i) {
+                IERC20(_tokensToRevoke[i]).forceApprove(_addr, 0);
+                emit RouterApproved(_tokensToRevoke[i], _addr, 0);
+            }
+        }
         emit Permit2Set(_addr, _active);
     }
 
@@ -283,18 +326,40 @@ contract TradeVault is Ownable2Step, Pausable, ReentrancyGuard {
     /// @dev    All swap parameters (amounts, slippage, recipient, path) are encoded
     ///         inside _callData. Token allowances are set ahead of time by the owner
     ///         via approveRouter / approveRouters, so no approval logic runs here.
-    ///         Tips are funded by the executor via msg.value, NOT from vault capital.
-    /// @param _router   Whitelisted router address.
-    /// @param _callData ABI-encoded router call including all swap params and slippage guard.
-    /// @param _tipTo    Validator / coinbase tip recipient (ignored when msg.value == 0).
+    ///
+    ///         The leading 4-byte function selector of _callData is checked against the
+    ///         per-router selector whitelist (setSelector / setSelectors). This restricts
+    ///         executors to pre-approved router operations (e.g. swaps) and blocks unintended
+    ///         functionality such as addLiquidity or multicall. The check is fail-closed:
+    ///         a router with no whitelisted selectors cannot be called.
+    ///
+    ///         Native-token swaps: _value wei is forwarded from the vault's balance to
+    ///         the router with the call, so routers that take native ETH as the input
+    ///         asset (e.g. swapExactETHForTokens) are fully supported. Pass 0 for pure
+    ///         ERC-20 -> ERC-20 swaps. The executor may also attach msg.value to top up
+    ///         the vault's ETH balance for the same call.
+    ///
+    ///         Tips are paid from the vault's ETH balance but are gated by the tip
+    ///         recipient whitelist, so a rogue executor cannot redirect vault funds.
+    /// @param _router    Whitelisted router address.
+    /// @param _value     Native ETH (wei) to forward to the router as swap input (0 if none).
+    /// @param _callData  ABI-encoded router call including all swap params and slippage guard.
+    /// @param _tipTo     Whitelisted validator / coinbase tip recipient (ignored when _tipAmount == 0).
+    /// @param _tipAmount ETH tip paid to _tipTo after the swap (0 to skip tipping).
     function swapViaRouter(
         address _router,
+        uint256 _value,
         bytes calldata _callData,
-        address payable _tipTo
+        address payable _tipTo,
+        uint256 _tipAmount
     ) external payable onlyExecutor whenNotPaused nonReentrant {
         if (!whitelistedRouters[_router]) revert RouterNotWhitelisted(_router);
+        if (_callData.length < 4) revert CallDataTooShort();
+        bytes4 selector = bytes4(_callData[:4]);
+        if (!whitelistedSelectors[_router][selector]) revert SelectorNotWhitelisted(_router, selector);
+        if (address(this).balance < _value) revert InsufficientBalance();
 
-        (bool success, bytes memory returnData) = _router.call(_callData);
+        (bool success, bytes memory returnData) = _router.call{value: _value}(_callData);
         if (!success) {
             assembly ("memory-safe") {
                 revert(add(returnData, 32), mload(returnData))
@@ -302,7 +367,7 @@ contract TradeVault is Ownable2Step, Pausable, ReentrancyGuard {
         }
         emit SwapExecuted(_router, _callData.length);
 
-        if (msg.value > 0) _tip(_tipTo, msg.value);
+        if (_tipAmount > 0) _tip(_tipTo, _tipAmount);
     }
 
     // ═══════════════════════════════════════════════════════════════════
